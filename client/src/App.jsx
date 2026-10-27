@@ -1,7 +1,10 @@
-﻿import { useState, useEffect, useCallback } from 'react';
+﻿import { useState, useEffect, useCallback, useRef } from 'react';
 import api from './api';
 import './App.css';
 import { getInitialTheme, applyTheme } from './theme.js';
+
+import useHotkeys from './hooks/useHotkeys.js';
+import useSelection from './hooks/useSelection.js';
 
 import ToastStack from './components/Toasts.jsx';
 import LoginScreen from './components/LoginScreen.jsx';
@@ -9,20 +12,27 @@ import VaultHeader from './components/VaultHeader.jsx';
 import DropZone from './components/DropZone.jsx';
 import Toolbar from './components/Toolbar.jsx';
 import FileList from './components/FileList.jsx';
+import BulkActionBar from './components/BulkActionBar.jsx';
 import ShareModal from './components/ShareModal.jsx';
 import PreviewModal from './components/PreviewModal.jsx';
+import MasterTerminal from './components/MasterTerminal.jsx';
+import GuestPanel from './components/GuestPanel.jsx';
 
 export default function App() {
+  // auth
   const [token, setToken] = useState(localStorage.getItem('matip_token'));
+  const [role, setRole] = useState(localStorage.getItem('matip_role') || 'guest');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [loginError, setLoginError] = useState('');
   const [loggingIn, setLoggingIn] = useState(false);
 
+  // theme
   const [theme, setTheme] = useState(getInitialTheme());
   useEffect(() => { applyTheme(theme); }, [theme]);
   const toggleTheme = () => setTheme((t) => (t === 'dark' ? 'light' : 'dark'));
 
+  // toasts
   const [toasts, setToasts] = useState([]);
   const pushToast = useCallback((type, message) => {
     const id = Date.now() + Math.random();
@@ -32,6 +42,7 @@ export default function App() {
     setToasts((t) => t.filter((x) => x.id !== id));
   }, []);
 
+  // files
   const [files, setFiles] = useState([]);
   const [total, setTotal] = useState(0);
   const [totalBytes, setTotalBytes] = useState(0);
@@ -39,20 +50,34 @@ export default function App() {
   const [search, setSearch] = useState('');
   const [sort, setSort] = useState('newest');
 
+  // selection
+  const selection = useSelection();
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [bulkBusy, setBulkBusy] = useState(false);
+
+  // upload
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadName, setUploadName] = useState('');
+  const uploadInputRef = useRef(null);
+  const searchRef = useRef(null);
 
+  // modals
   const [shareFor, setShareFor] = useState(null);
   const [previewFor, setPreviewFor] = useState(null);
+  const [terminalOpen, setTerminalOpen] = useState(false);
+  const [guestsOpen, setGuestsOpen] = useState(false);
 
+  // ——— auth ———
   const login = async (e) => {
     e.preventDefault();
     setLoginError(''); setLoggingIn(true);
     try {
       const { data } = await api.post('/auth/login', { username, password });
       localStorage.setItem('matip_token', data.token);
+      localStorage.setItem('matip_role', data.role || 'guest');
       setToken(data.token);
+      setRole(data.role || 'guest');
       pushToast('success', 'Vault unlocked');
     } catch (err) {
       const msg = err.response?.data?.error || 'Login failed';
@@ -61,10 +86,16 @@ export default function App() {
   };
   const logout = () => {
     localStorage.removeItem('matip_token');
-    setToken(null); setFiles([]); setTotal(0); setTotalBytes(0);
+    localStorage.removeItem('matip_role');
+    localStorage.removeItem('matip_master_token');
+    setToken(null); setRole('guest');
+    setFiles([]); setTotal(0); setTotalBytes(0);
+    selection.clear();
+    setSelectionMode(false);
     pushToast('info', 'Signed out');
   };
 
+  // ——— files ———
   const refresh = useCallback(async () => {
     setLoadingFiles(true);
     try {
@@ -82,6 +113,7 @@ export default function App() {
     return () => clearTimeout(t);
   }, [search, sort, refresh, token]);
 
+  // ——— upload ———
   const doUploadMany = async (fileList) => {
     const arr = Array.from(fileList || []);
     if (!arr.length) return;
@@ -108,6 +140,29 @@ export default function App() {
     }
   };
 
+  // ——— selection ———
+  const handleToggleSelect = useCallback((id) => {
+    selection.toggle(id);
+    setSelectionMode(true);
+  }, [selection]);
+
+  const handleSelectAll = useCallback(() => {
+    const ids = files.map((f) => f._id || f.id);
+    if (selection.size === ids.length) {
+      selection.clear();
+      setSelectionMode(false);
+    } else {
+      selection.set(ids);
+      setSelectionMode(true);
+    }
+  }, [files, selection]);
+
+  const clearSelection = useCallback(() => {
+    selection.clear();
+    setSelectionMode(false);
+  }, [selection]);
+
+  // ——— actions ———
   const download = async (id, filename) => {
     try {
       const { data } = await api.get(`/files/${id}/download`);
@@ -122,6 +177,16 @@ export default function App() {
     } catch { pushToast('error', 'Download failed'); }
   };
 
+  const downloadSelected = async () => {
+    setBulkBusy(true);
+    const selectedFiles = files.filter((f) => selection.has(f._id || f.id));
+    for (const f of selectedFiles) {
+      await download(f._id || f.id, f.originalName);
+    }
+    setBulkBusy(false);
+    clearSelection();
+  };
+
   const remove = async (id, filename) => {
     if (!confirm(`Delete "${filename}"?`)) return;
     try {
@@ -130,6 +195,24 @@ export default function App() {
       await refresh();
     } catch (err) {
       pushToast('error', err.response?.data?.error || 'Delete failed');
+    }
+  };
+
+  const removeSelected = async () => {
+    const ids = Array.from(selection.selected);
+    if (!ids.length) return;
+    if (!confirm(`Delete ${ids.length} file${ids.length === 1 ? '' : 's'}?`)) return;
+
+    setBulkBusy(true);
+    try {
+      const { data } = await api.post('/files/bulk-delete', { ids });
+      pushToast('success', `Deleted ${data.deleted} file${data.deleted === 1 ? '' : 's'}`);
+      await refresh();
+      clearSelection();
+    } catch (err) {
+      pushToast('error', err.response?.data?.error || 'Bulk delete failed');
+    } finally {
+      setBulkBusy(false);
     }
   };
 
@@ -153,6 +236,20 @@ export default function App() {
     }
   };
 
+  // ——— hotkeys ———
+  useHotkeys({
+    onSearch: () => searchRef.current?.focus(),
+    onEscape: () => {
+      if (shareFor) return setShareFor(null);
+      if (previewFor) return setPreviewFor(null);
+      if (selection.size > 0) return clearSelection();
+    },
+    onUpload: () => !uploading && uploadInputRef.current?.click(),
+    onRefresh: () => refresh(),
+    onSelectAll: () => files.length > 0 && handleSelectAll(),
+  });
+
+  // ——— render ———
   if (!token) {
     return (
       <>
@@ -162,7 +259,17 @@ export default function App() {
           username={username} password={password}
           setUsername={setUsername} setPassword={setPassword}
           loginError={loginError} loggingIn={loggingIn} onSubmit={login}
+          onOpenTerminal={() => setTerminalOpen(true)}
         />
+        {terminalOpen && (
+          <MasterTerminal
+            onClose={() => setTerminalOpen(false)}
+            onSuccess={() => {
+              setTerminalOpen(false);
+              setGuestsOpen(true);
+            }}
+          />
+        )}
       </>
     );
   }
@@ -170,16 +277,38 @@ export default function App() {
   return (
     <div className="app">
       <ToastStack toasts={toasts} onClose={removeToast} />
-      <VaultHeader theme={theme} onToggleTheme={toggleTheme} onLogout={logout} total={total} totalBytes={totalBytes} />
-      <DropZone uploading={uploading} progress={uploadProgress} currentName={uploadName} onFiles={doUploadMany} />
-      <Toolbar search={search} setSearch={setSearch} sort={sort} setSort={setSort} onRefresh={refresh} loading={loadingFiles} />
+      <VaultHeader theme={theme} onToggleTheme={toggleTheme} onLogout={logout} total={total} totalBytes={totalBytes} role={role} />
+      <DropZone
+        uploading={uploading}
+        progress={uploadProgress}
+        currentName={uploadName}
+        onFiles={doUploadMany}
+        inputRef={uploadInputRef}
+      />
+      <Toolbar
+        ref={searchRef}
+        search={search} setSearch={setSearch}
+        sort={sort} setSort={setSort}
+        onRefresh={refresh} loading={loadingFiles}
+        onSelectAll={handleSelectAll}
+        hasFiles={files.length > 0}
+      />
       <FileList
         files={files} loading={loadingFiles} search={search}
+        selection={selection} selectionMode={selectionMode}
+        onToggleSelect={handleToggleSelect}
         onStar={toggleStar}
         onShare={openShare}
         onDownload={download}
         onDelete={remove}
         onPreview={setPreviewFor}
+      />
+      <BulkActionBar
+        count={selection.size}
+        onDownloadAll={downloadSelected}
+        onDeleteAll={removeSelected}
+        onClear={clearSelection}
+        busy={bulkBusy}
       />
       <footer className="app-footer">
         <span>Matip</span><span className="dot">·</span><span>sealed, not shared</span>
@@ -198,6 +327,23 @@ export default function App() {
         onClose={() => setPreviewFor(null)}
         onDownload={download}
       />
+
+      {terminalOpen && (
+        <MasterTerminal
+          onClose={() => setTerminalOpen(false)}
+          onSuccess={() => {
+            setTerminalOpen(false);
+            setGuestsOpen(true);
+          }}
+        />
+      )}
+
+      {guestsOpen && (
+        <GuestPanel
+          onClose={() => setGuestsOpen(false)}
+          pushToast={pushToast}
+        />
+      )}
     </div>
   );
 }
